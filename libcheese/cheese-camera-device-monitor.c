@@ -45,7 +45,65 @@
 struct _CheeseCameraDeviceMonitorPrivate
 {
   GstDeviceMonitor *monitor;
+  GHashTable *devices;
 };
+
+typedef struct
+{
+  CheeseCameraDevice *device;
+  guint refs;
+} CheeseCameraDeviceMonitorEntry;
+
+static void
+cheese_camera_device_monitor_entry_free (gpointer data)
+{
+  CheeseCameraDeviceMonitorEntry *entry = data;
+
+  g_clear_object (&entry->device);
+  g_free (entry);
+}
+
+static gchar *
+cheese_camera_device_monitor_get_device_key (GstDevice *device)
+{
+  const GstStructure *properties;
+  const GValue *value;
+  gchar *display_name;
+  gchar *key = NULL;
+
+  properties = gst_device_get_properties (device);
+  if (properties != NULL)
+  {
+    value = gst_structure_get_value (properties, "api.v4l2.path");
+    if (value != NULL && G_VALUE_HOLDS_STRING (value))
+      return g_strdup_printf ("v4l2:%s", g_value_get_string (value));
+  }
+
+  display_name = gst_device_get_display_name (device);
+  if (display_name != NULL)
+    key = g_strdup_printf ("name:%s", display_name);
+  g_free (display_name);
+
+  if (key != NULL)
+    return key;
+
+  if (properties != NULL)
+  {
+    value = gst_structure_get_value (properties, "device.path");
+    if (value != NULL && G_VALUE_HOLDS_STRING (value))
+      return g_strdup_printf ("device:%s", g_value_get_string (value));
+
+    value = gst_structure_get_value (properties, "object.path");
+    if (value != NULL && G_VALUE_HOLDS_STRING (value))
+      return g_strdup_printf ("object:%s", g_value_get_string (value));
+
+    key = gst_structure_to_string (properties);
+    if (key != NULL)
+      return key;
+  }
+
+  return key;
+}
 
 static void initable_iface_init       (GInitableIface      *initable_iface);
 static void async_initable_iface_init (GAsyncInitableIface *async_initable_iface);
@@ -92,6 +150,8 @@ cheese_camera_device_monitor_set_up_device (GstDevice *device)
 {
   CheeseCameraDevice *newdev;
   GError *error = NULL;
+  const gchar *name;
+  const gchar *path;
 
   newdev = cheese_camera_device_new (device, &error);
 
@@ -99,6 +159,18 @@ cheese_camera_device_monitor_set_up_device (GstDevice *device)
     GST_WARNING ("Device initialization for %p failed: %s ",
                  device,
                  (error != NULL) ? error->message : "Unknown reason");
+
+  if (newdev == NULL)
+    return NULL;
+
+  name = cheese_camera_device_get_name (newdev);
+  path = cheese_camera_device_get_path (newdev);
+  if (g_strcmp0 (name, "ipu6") == 0)
+  {
+    GST_INFO ("Skipping raw IPU6 device %s (%s)", name, path != NULL ? path : "no-path");
+    g_clear_object (&newdev);
+    return NULL;
+  }
 
   return newdev;
 }
@@ -114,21 +186,43 @@ static void
 cheese_camera_device_monitor_added (CheeseCameraDeviceMonitor *monitor,
                                     GstDevice                 *device)
 {
-  CheeseCameraDevice *olddev;
+  CheeseCameraDeviceMonitorPrivate *priv;
+  CheeseCameraDeviceMonitorEntry *entry;
   CheeseCameraDevice *newdev;
+  gchar *key;
 
-  olddev = g_object_get_data (G_OBJECT (device), "cheese-camera-device");
-  if (olddev) {
-      GST_DEBUG ("Ignoring duplicate device %" GST_PTR_FORMAT, device);
+  priv = cheese_camera_device_monitor_get_instance_private (monitor);
+  key = cheese_camera_device_monitor_get_device_key (device);
+
+  if (key != NULL)
+  {
+    entry = g_hash_table_lookup (priv->devices, key);
+    if (entry != NULL)
+    {
+      entry->refs++;
+      g_object_set_data (G_OBJECT (device), "cheese-camera-device", entry->device);
+      GST_DEBUG ("Ignoring duplicate device %s (%" GST_PTR_FORMAT ")", key, device);
+      g_free (key);
       return;
+    }
   }
 
   newdev = cheese_camera_device_monitor_set_up_device (device);
   /* Ignore non-video devices, GNOME bug #677544. */
   if (newdev) {
     g_object_set_data (G_OBJECT (device), "cheese-camera-device", newdev);
+    if (key != NULL)
+    {
+      entry = g_new0 (CheeseCameraDeviceMonitorEntry, 1);
+      entry->device = g_object_ref (newdev);
+      entry->refs = 1;
+      g_hash_table_insert (priv->devices, key, entry);
+      key = NULL;
+    }
     g_signal_emit (monitor, monitor_signals[ADDED], 0, newdev);
   }
+
+  g_free (key);
 }
 
 /*
@@ -142,10 +236,35 @@ static void
 cheese_camera_device_monitor_removed (CheeseCameraDeviceMonitor *monitor,
                                       GstDevice                 *device)
 {
+  CheeseCameraDeviceMonitorPrivate *priv;
+  CheeseCameraDeviceMonitorEntry *entry;
   CheeseCameraDevice *olddev;
+  gchar *key;
 
+  priv = cheese_camera_device_monitor_get_instance_private (monitor);
   olddev = g_object_get_data (G_OBJECT (device), "cheese-camera-device");
-  if (olddev)
+  if (olddev == NULL)
+    return;
+
+  key = cheese_camera_device_monitor_get_device_key (device);
+  if (key != NULL)
+  {
+    entry = g_hash_table_lookup (priv->devices, key);
+    if (entry != NULL)
+    {
+      if (entry->refs > 1)
+      {
+        entry->refs--;
+        g_free (key);
+        return;
+      }
+
+      g_hash_table_remove (priv->devices, key);
+    }
+    g_free (key);
+  }
+
+  if (olddev != NULL)
     g_signal_emit (monitor, monitor_signals[REMOVED], 0, olddev);
 }
 
@@ -236,9 +355,10 @@ cheese_camera_device_monitor_finalize (GObject *object)
 {
     CheeseCameraDeviceMonitorPrivate *priv;
 
-    priv = cheese_camera_device_monitor_get_instance_private (CHEESE_CAMERA_DEVICE_MONITOR (object));
+  priv = cheese_camera_device_monitor_get_instance_private (CHEESE_CAMERA_DEVICE_MONITOR (object));
 
   gst_device_monitor_stop (priv->monitor);
+  g_clear_pointer (&priv->devices, g_hash_table_unref);
   g_clear_object (&priv->monitor);
 
   G_OBJECT_CLASS (cheese_camera_device_monitor_parent_class)->finalize (object);
@@ -300,6 +420,9 @@ initable_init (GInitable     *initable,
   GstCaps *caps;
 
   priv->monitor = gst_device_monitor_new ();
+  priv->devices = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                         g_free,
+                                         cheese_camera_device_monitor_entry_free);
 
   bus = gst_device_monitor_get_bus (priv->monitor);
   gst_bus_add_watch (bus, cheese_camera_device_monitor_bus_func, monitor);
@@ -307,6 +430,7 @@ initable_init (GInitable     *initable,
 
   caps = cheese_camera_device_supported_format_caps ();
   gst_device_monitor_add_filter (priv->monitor, "Video/Source", caps);
+  gst_device_monitor_add_filter (priv->monitor, "Source/Video", caps);
   gst_caps_unref (caps);
 
   gst_device_monitor_start (priv->monitor);
