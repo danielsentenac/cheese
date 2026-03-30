@@ -21,7 +21,12 @@ Tested on:
 
 - Fedora 43
 - Cheese 44.1
+- Dell Latitude 7450 laptop
 - Intel Meteor Lake IPU6 laptop
+
+Applicable case:
+
+- Fedora 43 on a Dell Latitude 7450 laptop with a built-in Intel IPU6 camera
 
 On that system, native Cheese falls back to `/dev/video0` and fails on the raw
 V4L2 path, while `libcamera` can enumerate the internal camera separately. This
